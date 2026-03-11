@@ -131,7 +131,7 @@ app.post('/webhook', async (req, res) => {
     const reply = aiResponse.content[0].text;
     conversationHistory[from].push({ role: 'assistant', content: reply });
     await axios.post(
-      `https://graph.facebook.com/v18.0/${phone_number_id}/messages`,
+      `https://graph.facebook.com/v17.0/${phone_number_id}/messages`,
       { messaging_product: 'whatsapp', to: from, type: 'text', text: { body: reply } },
       { headers: { Authorization: `Bearer ${WHATSAPP_TOKEN}`, 'Content-Type': 'application/json' } }
     );
