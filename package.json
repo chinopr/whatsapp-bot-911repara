@@ -1,0 +1,15 @@
+{
+  "name": "whatsapp-bot-911reparame",
+  "version": "1.0.0",
+  "description": "WhatsApp Bot con IA para 911reparame",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "express": "^4.18.2",
+    "axios": "^1.4.0",
+    "@anthropic-ai/sdk": "^0.9.0",
+    "dotenv": "^16.0.3"
+  }
+}
