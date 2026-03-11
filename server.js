@@ -2,7 +2,6 @@ const express = require('express');
 const axios = require('axios');
 const Anthropic = require('@anthropic-ai/sdk');
 require('dotenv').config();
-<<<<<<< HEAD
 
 const app = express();
 app.use(express.json());
@@ -15,14 +14,10 @@ const GOOGLE_API_KEY  = process.env.GOOGLE_API_KEY;
 const SHEET_ID        = process.env.SHEET_ID;
 
 const client = new Anthropic({ apiKey: CLAUDE_API_KEY });
-
-// ── HISTORIAL DE CONVERSACIONES ──────────────────────────────────────────
 const conversationHistory = {};
-
-// ── CACHE DE PRECIOS (se refresca cada 1 hora) ───────────────────────────
 let sheetCache = null;
 let cacheTimestamp = 0;
-const CACHE_TTL_MS = 60 * 60 * 1000; // 1 hora
+const CACHE_TTL_MS = 60 * 60 * 1000;
 
 async function fetchSheetData(sheetName) {
   const url = `https://sheets.googleapis.com/v4/spreadsheets/${SHEET_ID}/values/${encodeURIComponent(sheetName)}?key=${GOOGLE_API_KEY}`;
@@ -39,10 +34,8 @@ async function fetchSheetData(sheetName) {
 
 async function getPriceData() {
   const now = Date.now();
-  if (sheetCache && (now - cacheTimestamp) < CACHE_TTL_MS) {
-    return sheetCache;
-  }
-  console.log('🔄 Actualizando cache de precios desde Google Sheets...');
+  if (sheetCache && (now - cacheTimestamp) < CACHE_TTL_MS) return sheetCache;
+  console.log('Actualizando cache de precios...');
   try {
     const [reparaciones, ventas, accesorios] = await Promise.all([
       fetchSheetData('Reparaciones'),
@@ -51,251 +44,109 @@ async function getPriceData() {
     ]);
     sheetCache = { reparaciones, ventas, accesorios };
     cacheTimestamp = now;
-    console.log(`✅ Cache actualizado: ${reparaciones.length} reparaciones, ${ventas.length} ventas, ${accesorios.length} accesorios`);
+    console.log('Cache actualizado:', reparaciones.length, 'reparaciones,', ventas.length, 'ventas,', accesorios.length, 'accesorios');
     return sheetCache;
   } catch (err) {
-    console.error('❌ Error leyendo Google Sheets:', err.message);
+    console.error('Error leyendo Sheets:', err.message);
     return sheetCache || { reparaciones: [], ventas: [], accesorios: [] };
   }
 }
 
 function buildPriceContext(data) {
   let ctx = '';
-
-  // Reparaciones activas
-  const repsActivas = data.reparaciones.filter(r =>
-    r['Notas / Estado'] !== 'Descontinuado'
-  );
+  const repsActivas = data.reparaciones.filter(r => r['Notas / Estado'] !== 'Descontinuado');
   if (repsActivas.length > 0) {
-    ctx += '\n=== REPARACIONES ===\n';
+    ctx += '\nREPARACIONES:\n';
     const byService = {};
     repsActivas.forEach(r => {
       const key = `${r['Dispositivo']} ${r['Marca']} ${r['Modelo']} - ${r['Servicio']}`;
-      byService[key] = {
-        min: r['Precio Mín ($)'],
-        max: r['Precio Máx ($)'],
-        tiempo: r['Tiempo Estim.'],
-      };
+      byService[key] = { min: r['Precio Mín ($)'], max: r['Precio Máx ($)'], tiempo: r['Tiempo Estim.'] };
     });
     Object.entries(byService).slice(0, 120).forEach(([k, v]) => {
-      ctx += `• ${k}: $${v.min}-$${v.max} | ${v.tiempo}\n`;
+      ctx += `- ${k}: $${v.min}-$${v.max} | ${v.tiempo}\n`;
     });
-    ctx += '(Si no encuentras el modelo exacto, da un estimado basado en modelos similares)\n';
   }
-
-  // Ventas disponibles
   const ventasDisp = data.ventas.filter(v => v['Disponibilidad'] === 'Sí');
   if (ventasDisp.length > 0) {
-    ctx += '\n=== EQUIPOS EN VENTA (DISPONIBLES) ===\n';
-    ventasDisp.forEach(v => {
-      ctx += `• ${v['Tipo']} ${v['Marca']} ${v['Modelo']} - ${v['Condición']} - $${v['Precio ($)']}\n`;
-    });
+    ctx += '\nEQUIPOS EN VENTA:\n';
+    ventasDisp.forEach(v => { ctx += `- ${v['Tipo']} ${v['Marca']} ${v['Modelo']} - ${v['Condición']} - $${v['Precio ($)']}\n`; });
   }
-
-  const ventasBajoPedido = data.ventas.filter(v => v['Disponibilidad'] === 'Bajo pedido');
-  if (ventasBajoPedido.length > 0) {
-    ctx += '\n=== EQUIPOS BAJO PEDIDO ===\n';
-    ventasBajoPedido.forEach(v => {
-      ctx += `• ${v['Tipo']} ${v['Marca']} ${v['Modelo']} - $${v['Precio ($)']}\n`;
-    });
-  }
-
-  // Accesorios disponibles
   const accDisp = data.accesorios.filter(a => a['Disponibilidad'] === 'Sí');
   if (accDisp.length > 0) {
-    ctx += '\n=== ACCESORIOS Y PREPAGADOS ===\n';
-    accDisp.forEach(a => {
-      ctx += `• ${a['Tipo']}: ${a['Descripción']} - $${a['Precio ($)']}\n`;
-    });
+    ctx += '\nACCESORIOS:\n';
+    accDisp.forEach(a => { ctx += `- ${a['Tipo']}: ${a['Descripción']} - $${a['Precio ($)']}\n`; });
   }
-
   return ctx;
 }
 
-// ── SYSTEM PROMPT ────────────────────────────────────────────────────────
 function buildSystemPrompt(priceContext) {
-  return `Eres Alex, el asistente virtual de 911reparame, un negocio de tecnología en Puerto Rico.
-Responde SIEMPRE en español, de forma amigable y concisa (máximo 3-4 oraciones).
-Usa emojis ocasionalmente para ser más cercano 📱.
+  return `Eres Alex, asistente virtual de 911reparame en Puerto Rico. Responde SIEMPRE en español, amigable y conciso (max 3-4 oraciones). Usa emojis ocasionalmente.
 
-SERVICIOS QUE OFRECEMOS:
-- Reparación de celulares, tabletas y consolas
-- Venta de equipos nuevos y usados
-- Servicios prepagados (recargas, planes, activaciones)
-- Accesorios y tecnología
+SERVICIOS: Reparacion de celulares, tabletas y consolas. Venta de equipos. Servicios prepagados. Accesorios.
 
 INSTRUCCIONES:
-- Para cotizar reparaciones, pide: marca, modelo exacto y descripción del problema
-- Nunca inventes precios que no estén en la lista — si no está, di que consultarás y responderás pronto
-- Si el equipo no está en la lista, da un estimado basado en modelos similares y acláralo
-- Para ventas, confirma disponibilidad con el cliente antes de comprometerte
-- Si el cliente quiere proceder, pide nombre y número para que un asesor le contacte
-- Si no sabes algo, sé honesto: "Déjame verificarlo y te confirmo enseguida"
+- Para cotizar pide: marca, modelo y problema
+- Nunca inventes precios que no esten en la lista
+- Si el cliente quiere proceder pide nombre y telefono
+- Si no sabes algo di que un asesor confirmara pronto
 
 PRECIOS ACTUALIZADOS:
 ${priceContext}`;
 }
 
-// ── WEBHOOK GET — Verificación de Meta ──────────────────────────────────
 app.get('/webhook', (req, res) => {
   const verify_token = req.query['hub.verify_token'];
-  const challenge    = req.query['hub.challenge'];
+  const challenge = req.query['hub.challenge'];
   if (verify_token === VERIFY_TOKEN) {
-    console.log('✅ Webhook verificado');
+    console.log('Webhook verificado');
     res.send(challenge);
   } else {
-    console.log('❌ Token incorrecto');
     res.sendStatus(403);
   }
 });
 
-// ── WEBHOOK POST — Recibir mensajes ──────────────────────────────────────
 app.post('/webhook', async (req, res) => {
-  res.sendStatus(200); // Responder a Meta inmediatamente
-
+  res.sendStatus(200);
   try {
-    const entry          = req.body?.entry?.[0];
-    const changes        = entry?.changes?.[0];
-    const message        = changes?.value?.messages?.[0];
-
+    const entry = req.body?.entry?.[0];
+    const changes = entry?.changes?.[0];
+    const message = changes?.value?.messages?.[0];
     if (!message || message.type !== 'text') return;
-
-    const from            = message.from;
-    const msg_body        = message.text.body;
+    const from = message.from;
+    const msg_body = message.text.body;
     const phone_number_id = changes?.value?.metadata?.phone_number_id;
-
-    console.log(`📩 Mensaje de ${from}: ${msg_body}`);
-
-    // Historial por cliente (últimos 10 mensajes)
+    console.log('Mensaje de', from, ':', msg_body);
     if (!conversationHistory[from]) conversationHistory[from] = [];
     conversationHistory[from].push({ role: 'user', content: msg_body });
-    if (conversationHistory[from].length > 10) {
-      conversationHistory[from] = conversationHistory[from].slice(-10);
-    }
-
-    // Obtener precios actualizados desde Sheets
-    const priceData    = await getPriceData();
+    if (conversationHistory[from].length > 10) conversationHistory[from] = conversationHistory[from].slice(-10);
+    const priceData = await getPriceData();
     const priceContext = buildPriceContext(priceData);
     const systemPrompt = buildSystemPrompt(priceContext);
-
-    // Llamar a Claude
     const aiResponse = await client.messages.create({
       model: 'claude-haiku-4-5-20251001',
       max_tokens: 500,
       system: systemPrompt,
       messages: conversationHistory[from],
     });
-
     const reply = aiResponse.content[0].text;
     conversationHistory[from].push({ role: 'assistant', content: reply });
-
-    // Enviar respuesta por WhatsApp
     await axios.post(
       `https://graph.facebook.com/v18.0/${phone_number_id}/messages`,
-      {
-        messaging_product: 'whatsapp',
-        to: from,
-        type: 'text',
-        text: { body: reply },
-      },
-      {
-        headers: {
-          Authorization: `Bearer ${WHATSAPP_TOKEN}`,
-          'Content-Type': 'application/json',
-        },
-      }
+      { messaging_product: 'whatsapp', to: from, type: 'text', text: { body: reply } },
+      { headers: { Authorization: `Bearer ${WHATSAPP_TOKEN}`, 'Content-Type': 'application/json' } }
     );
-
-    console.log(`✅ Respuesta enviada a ${from}`);
-
+    console.log('Respuesta enviada a', from);
   } catch (err) {
-    console.error('❌ Error:', err.message);
+    console.error('Error:', err.message);
   }
 });
 
-// ── HEALTH CHECK ─────────────────────────────────────────────────────────
 app.get('/', (req, res) => {
   res.json({ status: 'ok', negocio: '911reparame Bot', version: '2.0' });
 });
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, async () => {
-  console.log(`🚀 911reparame Bot corriendo en puerto ${PORT}`);
-  await getPriceData(); // Pre-cargar precios al iniciar
+  console.log('911reparame Bot corriendo en puerto', PORT);
+  await getPriceData();
 });
-=======
-const app = express();
-app.use(express.json());
-const WHATSAPP_TOKEN = process.env.WHATSAPP_TOKEN;
-const PHONE_NUMBER_ID = process.env.PHONE_NUMBER_ID;
-const VERIFY_TOKEN = process.env.VERIFY_TOKEN || 'tu_token_verificacion';
-const CLAUDE_API_KEY = process.env.CLAUDE_API_KEY;
-const client = new Anthropic({ apiKey: CLAUDE_API_KEY });
-// Webhook GET para verificación de Meta
-app.get('/webhook', (req, res) => {
-  const verify_token = req.query['hub.verify_token'];
-  const challenge = req.query['hub.challenge'];
-  if (verify_token === VERIFY_TOKEN) {
-    res.send(challenge);
-  } else {
-    res.sendStatus(403);
-  }
-});
-// Webhook POST para recibir mensajes
-app.post('/webhook', async (req, res) => {
-  const body = req.body;
-  if (body.object) {
-    if (
-      body.entry &&
-      body.entry[0].changes &&
-      body.entry[0].changes[0].value.messages &&
-      body.entry[0].changes[0].value.messages[0]
-    ) {
-      const phone_number_id = body.entry[0].changes[0].value.metadata.phone_number_id;
-      const from = body.entry[0].changes[0].value.messages[0].from;
-      const msg_body = body.entry[0].changes[0].value.messages[0].text.body;
-      console.log(`Mensaje de ${from}: ${msg_body}`);
-      // Obtener respuesta de Claude
-      const message = await client.messages.create({
-        model: 'claude-3-5-haiku-20241022',
-        max_tokens: 1024,
-        messages: [
-          {
-            role: 'user',
-            content: msg_body,
-          },
-        ],
-      });
-      const response_text = message.content[0].text;
-      // Enviar respuesta a WhatsApp
-      await axios.post(
-        `https://graph.instagram.com/v18.0/${phone_number_id}/messages?access_token=${WHATSAPP_TOKEN}`,
-        {
-          messaging_product: 'whatsapp',
-          to: from,
-          type: 'text',
-          text: {
-            body: response_text,
-          },
-        }
-      );
-      res.sendStatus(200);
-    } else {
-      res.sendStatus(404);
-    }
-  } else {
-    res.sendStatus(404);
-  }
-});
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
-  console.log(`Servidor escuchando en puerto ${PORT}`);
-});
-```
-**Archivo 3: `.env` (para Railway)**
-```
-WHATSAPP_TOKEN=tu_token_aqui
-PHONE_NUMBER_ID=1060580410464281
-VERIFY_TOKEN=tu_token_verificacion
-CLAUDE_API_KEY=tu_api_key_anthropic
->>>>>>> ede22cc773bfbae67eb0c65b065556109d6ec7f6
