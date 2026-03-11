@@ -1,6 +1,7 @@
 const express = require('express');
 const axios = require('axios');
 const Anthropic = require('@anthropic-ai/sdk');
+const { google } = require('googleapis');
 require('dotenv').config();
 
 const app = express();
@@ -18,6 +19,29 @@ const conversationHistory = {};
 let sheetCache = null;
 let cacheTimestamp = 0;
 const CACHE_TTL_MS = 60 * 60 * 1000;
+
+async function saveLead(nombre, telefono, servicio, whatsappNum) {
+  try {
+    const keyJson = JSON.parse(process.env.GOOGLE_SERVICE_ACCOUNT_KEY);
+    const auth = new google.auth.GoogleAuth({
+      credentials: keyJson,
+      scopes: ['https://www.googleapis.com/auth/spreadsheets'],
+    });
+    const sheets = google.sheets({ version: 'v4', auth });
+    const fecha = new Date().toLocaleString('es-PR', { timeZone: 'America/Puerto_Rico' });
+    await sheets.spreadsheets.values.append({
+      spreadsheetId: SHEET_ID,
+      range: 'Leads!A:F',
+      valueInputOption: 'USER_ENTERED',
+      resource: {
+        values: [[fecha, nombre, telefono, servicio, whatsappNum, 'Nuevo']]
+      }
+    });
+    console.log('Lead guardado:', nombre, telefono, servicio);
+  } catch (err) {
+    console.error('Error guardando lead:', err.message);
+  }
+}
 
 async function fetchSheetData(sheetName) {
   const url = `https://sheets.googleapis.com/v4/spreadsheets/${SHEET_ID}/values/${encodeURIComponent(sheetName)}?key=${GOOGLE_API_KEY}`;
@@ -103,10 +127,20 @@ DIAGNÓSTICO:
 - Se cobra $10 por diagnóstico
 - Si el cliente acepta la reparación, esos $10 se descuentan del precio final
 
-INSTRUCCIONES:
-- Para cotizar pide: marca, modelo y problema
+INSTRUCCIONES DE COTIZACIÓN:
+- Cuando el cliente mencione un dispositivo o servicio, comparte enseguida el rango de precio ("entre $X y $Y") de forma natural y amigable
+- Para afinar la cotización pide: marca, modelo exacto y descripción del problema
 - Nunca inventes precios que no estén en la lista
-- Si el cliente quiere proceder pide nombre y teléfono
+- Si hay varios modelos similares, muestra los rangos disponibles para que el cliente elija
+- Si el servicio no está en la lista di que un asesor confirmará el precio
+
+CAPTURA DE LEADS:
+- Cuando el cliente quiera proceder, pide su nombre y teléfono
+- Al recibir nombre y teléfono, incluye al FINAL de tu respuesta (invisible para el cliente) la siguiente etiqueta exacta:
+  [LEAD: nombre=NOMBRE_AQUI, telefono=TELEFONO_AQUI, servicio=SERVICIO_AQUI]
+- Esta etiqueta es solo para el sistema, no la menciones ni expliques al cliente
+
+OTRAS INSTRUCCIONES:
 - Si no sabes algo di que un asesor confirmará pronto
 - Si preguntan por horario de sábado indica que es variable y que llamen al 787-996-6976 para confirmar
 
@@ -148,7 +182,16 @@ app.post('/webhook', async (req, res) => {
       system: systemPrompt,
       messages: conversationHistory[from],
     });
-    const reply = aiResponse.content[0].text;
+    let reply = aiResponse.content[0].text;
+
+    // Detectar y guardar lead si el bot capturó nombre y teléfono
+    const leadMatch = reply.match(/\[LEAD:\s*nombre=([^,\]]+),\s*telefono=([^,\]]+),\s*servicio=([^\]]+)\]/i);
+    if (leadMatch) {
+      const [, nombre, telefono, servicio] = leadMatch;
+      reply = reply.replace(leadMatch[0], '').trim();
+      await saveLead(nombre.trim(), telefono.trim(), servicio.trim(), from);
+    }
+
     conversationHistory[from].push({ role: 'assistant', content: reply });
     await axios.post(
       `https://graph.facebook.com/v17.0/${phone_number_id}/messages`,
