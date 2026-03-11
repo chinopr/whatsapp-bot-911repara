@@ -208,6 +208,21 @@ app.get('/', (req, res) => {
   res.json({ status: 'ok', negocio: '911reparame Bot', version: '2.0' });
 });
 
+// Endpoint de diagnóstico — ver qué datos cargó el bot desde el Sheet
+app.get('/debug-prices', async (req, res) => {
+  const data = await getPriceData();
+  const context = buildPriceContext(data);
+  res.json({
+    totales: {
+      reparaciones: data.reparaciones.length,
+      ventas: data.ventas.length,
+      accesorios: data.accesorios.length,
+    },
+    contexto_enviado_al_bot: context,
+    muestra_reparaciones: data.reparaciones.slice(0, 5),
+  });
+});
+
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, async () => {
   console.log('911reparame Bot corriendo en puerto', PORT);
