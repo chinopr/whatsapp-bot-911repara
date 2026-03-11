@@ -137,7 +137,7 @@ app.post('/webhook', async (req, res) => {
     );
     console.log('Respuesta enviada a', from);
   } catch (err) {
-    console.error('Error:', err.message);
+    console.error('Error:', err.message, JSON.stringify(err?.response?.data));
   }
 });
 
