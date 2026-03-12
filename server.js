@@ -108,10 +108,10 @@ async function fetchSheetData(sheetName) {
   const url = `https://sheets.googleapis.com/v4/spreadsheets/${SHEET_ID}/values/${encodeURIComponent(sheetName)}?key=${GOOGLE_API_KEY}`;
   const res = await axios.get(url);
   const rows = res.data.values || [];
-  // Fila 0 = título decorativo, Fila 1 = encabezados reales, Fila 2+ = datos
-  if (rows.length < 3) return [];
-  const headers = rows[1];
-  return rows.slice(2).map(row => {
+  // Fila 0 = título, Fila 1 = descripción, Fila 2 = encabezados reales, Fila 3+ = datos
+  if (rows.length < 4) return [];
+  const headers = rows[2];
+  return rows.slice(3).map(row => {
     const obj = {};
     headers.forEach((h, i) => { obj[h] = row[i] || ''; });
     return obj;
