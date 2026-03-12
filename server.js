@@ -4,7 +4,7 @@ const Anthropic = require('@anthropic-ai/sdk');
 const { google } = require('googleapis');
 require('dotenv').config();
 
-// Redis opcional — si REDIS_URL está configurado se usa, si no cae a memoria
+// ─── Redis opcional ───────────────────────────────────────────────────────────
 let redisClient = null;
 (async () => {
   if (process.env.REDIS_URL) {
@@ -24,25 +24,34 @@ let redisClient = null;
 const app = express();
 app.use(express.json());
 
+// ─── Configuración ────────────────────────────────────────────────────────────
 const WHATSAPP_TOKEN  = process.env.WHATSAPP_TOKEN;
 const PHONE_NUMBER_ID = process.env.PHONE_NUMBER_ID;
 const VERIFY_TOKEN    = process.env.VERIFY_TOKEN;
 const CLAUDE_API_KEY  = process.env.CLAUDE_API_KEY;
 const GOOGLE_API_KEY  = process.env.GOOGLE_API_KEY;
 const SHEET_ID        = process.env.SHEET_ID;
+const OWNER_PHONE     = process.env.OWNER_PHONE; // ej: 17879966976 (sin + ni espacios)
 
-const WHATSAPP_API_VERSION = 'v21.0';
-const HISTORY_TTL_SECONDS  = 60 * 60 * 24; // 24 horas
-const MAX_HISTORY_MESSAGES = 10;
-const RATE_LIMIT_WINDOW_MS = 60 * 1000; // 1 minuto
-const RATE_LIMIT_MAX_MSGS  = 10;        // máx mensajes por minuto por usuario
+const WHATSAPP_API_VERSION  = 'v21.0';
+const HISTORY_TTL_SECONDS   = 60 * 60 * 24; // 24 horas
+const MAX_HISTORY_MESSAGES  = 10;
+const RATE_LIMIT_WINDOW_MS  = 60 * 1000;
+const RATE_LIMIT_MAX_MSGS   = 10;
+const CLAUDE_TIMEOUT_MS     = 15000; // 15 seg
+const SHEETS_TIMEOUT_MS     = 10000; // 10 seg
 
 const MAPS_URL = 'https://www.google.com/maps/dir//911+repara.me,+Walgreens,+Carretera+2+Int+Carretera+149+Frente+Farmacia,+Manat%C3%AD,+00674/@18.436519,-66.4390542,15z/data=!4m8!4m7!1m0!1m5!1m1!1s0x8c031780deae45f3:0x13d55e015794b54e!2m2!1d-66.475142!2d18.431694?entry=ttu&g_ep=EgoyMDI2MDMwOS4wIKXMDSoASAFQAw%3D%3D';
 
 const client = new Anthropic({ apiKey: CLAUDE_API_KEY });
 
-// ─── Historial de conversación (Redis o memoria) ─────────────────────────────
+// ─── Deduplicación de mensajes ────────────────────────────────────────────────
+const processedMsgIds = new Set();
+setInterval(() => processedMsgIds.clear(), 10 * 60 * 1000); // limpiar cada 10 min
+
+// ─── Historial (Redis o memoria) ──────────────────────────────────────────────
 const memoryHistory = {};
+const memoryNewUsers = new Set();
 
 async function getHistory(userId) {
   if (redisClient) {
@@ -60,7 +69,23 @@ async function saveHistory(userId, history) {
   }
 }
 
-// ─── Rate limiting (en memoria) ──────────────────────────────────────────────
+async function isNewUser(userId) {
+  if (redisClient) {
+    const exists = await redisClient.exists(`seen:${userId}`);
+    return exists === 0;
+  }
+  return !memoryNewUsers.has(userId);
+}
+
+async function markUserSeen(userId) {
+  if (redisClient) {
+    await redisClient.setEx(`seen:${userId}`, 60 * 60 * 24 * 90, '1'); // 90 días
+  } else {
+    memoryNewUsers.add(userId);
+  }
+}
+
+// ─── Rate limiting ────────────────────────────────────────────────────────────
 const rateLimitMap = {};
 
 function isRateLimited(userId) {
@@ -79,7 +104,94 @@ function isRateLimited(userId) {
   return state.count > RATE_LIMIT_MAX_MSGS;
 }
 
-// ─── Google Sheets — guardar lead ────────────────────────────────────────────
+// ─── Horario de negocio ───────────────────────────────────────────────────────
+function isBusinessHours() {
+  const prTime = new Date(new Date().toLocaleString('en-US', { timeZone: 'America/Puerto_Rico' }));
+  const day  = prTime.getDay(); // 0=Dom, 1=Lun, 2=Mar ... 5=Vie, 6=Sáb
+  const mins = prTime.getHours() * 60 + prTime.getMinutes();
+  // Martes(2) a Viernes(5): 11:30am–5:30pm
+  return day >= 2 && day <= 5 && mins >= 11 * 60 + 30 && mins <= 17 * 60 + 30;
+}
+
+// ─── WhatsApp — helpers ───────────────────────────────────────────────────────
+const WA_HEADERS = () => ({
+  Authorization: `Bearer ${WHATSAPP_TOKEN}`,
+  'Content-Type': 'application/json',
+});
+const WA_URL = (id) => `https://graph.facebook.com/${WHATSAPP_API_VERSION}/${id}/messages`;
+
+async function sendWhatsAppMessage(phoneNumberId, to, text) {
+  await axios.post(WA_URL(phoneNumberId),
+    { messaging_product: 'whatsapp', to, type: 'text', text: { body: text } },
+    { headers: WA_HEADERS(), timeout: SHEETS_TIMEOUT_MS }
+  );
+}
+
+async function markAsRead(phoneNumberId, messageId) {
+  try {
+    await axios.post(WA_URL(phoneNumberId),
+      { messaging_product: 'whatsapp', status: 'read', message_id: messageId },
+      { headers: WA_HEADERS(), timeout: 5000 }
+    );
+  } catch (_) { /* no crítico */ }
+}
+
+async function sendLocationButton(phoneNumberId, to) {
+  await axios.post(WA_URL(phoneNumberId), {
+    messaging_product: 'whatsapp', to,
+    type: 'interactive',
+    interactive: {
+      type: 'cta_url',
+      body: { text: '📍 *Carretera 149, intersección con Carretera 2*\nFrente a Manatí Plaza Shopping Center\n\nToca el botón para abrir Google Maps:' },
+      action: { name: 'cta_url', parameters: { display_text: 'Como llegar 📍', url: MAPS_URL } },
+    },
+  }, { headers: WA_HEADERS(), timeout: SHEETS_TIMEOUT_MS });
+}
+
+async function sendWelcomeMenu(phoneNumberId, to) {
+  try {
+    await axios.post(WA_URL(phoneNumberId), {
+      messaging_product: 'whatsapp', to,
+      type: 'interactive',
+      interactive: {
+        type: 'list',
+        header: { type: 'text', text: '¡Hola! Soy Alex 👋' },
+        body:   { text: '¿En qué te puedo ayudar hoy? Selecciona una opción o escríbeme directamente.' },
+        footer: { text: '911reparame • Manatí, PR' },
+        action: {
+          button: 'Ver opciones',
+          sections: [{
+            title: 'Servicios',
+            rows: [
+              { id: 'menu_cotizar',   title: '💰 Cotizar reparación',      description: 'Obtén un precio estimado' },
+              { id: 'menu_horario',   title: '🕐 Horario y ubicación',     description: 'Dónde estamos y cuándo' },
+              { id: 'menu_ventas',    title: '📱 Equipos en venta',        description: 'Ver equipos disponibles' },
+              { id: 'menu_asesor',    title: '👨‍💻 Hablar con un asesor',   description: 'Te contactamos pronto' },
+            ],
+          }],
+        },
+      },
+    }, { headers: WA_HEADERS(), timeout: SHEETS_TIMEOUT_MS });
+  } catch (err) {
+    // Si falla el menú (ej. sandbox no lo soporta), enviar texto simple
+    await sendWhatsAppMessage(phoneNumberId, to,
+      '¡Hola! Soy *Alex*, asistente virtual de *911reparame* 👋\n\nPuedo ayudarte con cotizaciones, horario, ubicación y equipos en venta. ¿En qué te puedo ayudar?');
+  }
+}
+
+// ─── Notificar al dueño cuando llega un lead ──────────────────────────────────
+async function notifyOwner(nombre, telefono, servicio, clienteWa) {
+  if (!OWNER_PHONE || !PHONE_NUMBER_ID) return;
+  try {
+    const msg = `🔔 *Nuevo Lead — 911reparame*\n\n👤 *Nombre:* ${nombre}\n📞 *Teléfono:* ${telefono}\n🔧 *Servicio:* ${servicio}\n📱 *WhatsApp cliente:* +${clienteWa}`;
+    await sendWhatsAppMessage(PHONE_NUMBER_ID, OWNER_PHONE, msg);
+    console.log('Dueño notificado del lead:', nombre);
+  } catch (err) {
+    console.error('Error notificando al dueño:', err.message);
+  }
+}
+
+// ─── Google Sheets — lead ─────────────────────────────────────────────────────
 async function saveLead(nombre, telefono, servicio, whatsappNum) {
   try {
     const keyJson = JSON.parse(process.env.GOOGLE_SERVICE_ACCOUNT_KEY);
@@ -93,7 +205,7 @@ async function saveLead(nombre, telefono, servicio, whatsappNum) {
       spreadsheetId: SHEET_ID,
       range: 'Leads!A:F',
       valueInputOption: 'USER_ENTERED',
-      resource: { values: [[fecha, nombre, telefono, servicio, whatsappNum, 'Nuevo']] }
+      resource: { values: [[fecha, nombre, telefono, servicio, whatsappNum, 'Nuevo']] },
     });
     console.log('Lead guardado:', nombre, telefono, servicio);
   } catch (err) {
@@ -101,14 +213,14 @@ async function saveLead(nombre, telefono, servicio, whatsappNum) {
   }
 }
 
-// ─── Google Sheets — precios ─────────────────────────────────────────────────
+// ─── Google Sheets — precios ──────────────────────────────────────────────────
 let sheetCache = null;
 let cacheTimestamp = 0;
 const CACHE_TTL_MS = 60 * 60 * 1000;
 
 async function fetchSheetData(sheetName) {
   const url = `https://sheets.googleapis.com/v4/spreadsheets/${SHEET_ID}/values/${encodeURIComponent(sheetName)}?key=${GOOGLE_API_KEY}`;
-  const res = await axios.get(url);
+  const res = await axios.get(url, { timeout: SHEETS_TIMEOUT_MS });
   const rows = res.data.values || [];
   // Fila 0 = título, Fila 1 = descripción, Fila 2 = encabezados reales, Fila 3+ = datos
   if (rows.length < 4) return [];
@@ -120,9 +232,9 @@ async function fetchSheetData(sheetName) {
   });
 }
 
-async function getPriceData() {
+async function getPriceData(forceRefresh = false) {
   const now = Date.now();
-  if (sheetCache && (now - cacheTimestamp) < CACHE_TTL_MS) return sheetCache;
+  if (!forceRefresh && sheetCache && (now - cacheTimestamp) < CACHE_TTL_MS) return sheetCache;
   console.log('Actualizando cache de precios...');
   try {
     const [reparaciones, ventas, accesorios] = await Promise.all([
@@ -140,47 +252,40 @@ async function getPriceData() {
   }
 }
 
-// ─── Búsqueda inteligente de reparaciones ────────────────────────────────────
-// Alias de marcas y modelos comunes para detectar del mensaje del cliente
+// ─── Búsqueda inteligente de reparaciones ─────────────────────────────────────
 const BRAND_ALIASES = {
-  apple:      ['apple', 'iphone', 'ipad', 'macbook', 'mac'],
-  samsung:    ['samsung', 'galaxy', 's24', 's23', 's22', 's21', 's20', 's10', 'note', 'a54', 'a34', 'a15'],
-  google:     ['google', 'pixel'],
-  motorola:   ['motorola', 'moto'],
-  lg:         ['lg'],
-  sony:       ['sony', 'xperia'],
-  huawei:     ['huawei'],
-  oneplus:    ['oneplus', 'one plus'],
-  nintendo:   ['nintendo', 'switch'],
-  playstation:['playstation', 'ps4', 'ps5', 'ps3'],
-  xbox:       ['xbox'],
+  apple:       ['apple', 'iphone', 'ipad', 'macbook', 'mac'],
+  samsung:     ['samsung', 'galaxy', 's24', 's23', 's22', 's21', 's20', 's10', 'note', 'a54', 'a34', 'a15'],
+  google:      ['google', 'pixel'],
+  motorola:    ['motorola', 'moto'],
+  lg:          ['lg'],
+  sony:        ['sony', 'xperia'],
+  huawei:      ['huawei'],
+  oneplus:     ['oneplus', 'one plus'],
+  nintendo:    ['nintendo', 'switch'],
+  playstation: ['playstation', 'ps4', 'ps5', 'ps3'],
+  xbox:        ['xbox'],
 };
 
-function filterRepairsByMessage(reparaciones, conversationText) {
-  const msg = conversationText.toLowerCase();
+// Recibe el historial completo para no perder contexto entre mensajes
+function filterRepairsByConversation(reparaciones, history, currentMsg) {
+  // Concatenar todos los mensajes del cliente para tener contexto completo
+  const allText = [
+    ...history.filter(m => m.role === 'user').map(m => m.content),
+    currentMsg,
+  ].join(' ').toLowerCase();
 
-  // Detectar marca
   let brandAliases = null;
   for (const [, aliases] of Object.entries(BRAND_ALIASES)) {
-    if (aliases.some(a => msg.includes(a))) {
-      brandAliases = aliases;
-      break;
-    }
+    if (aliases.some(a => allText.includes(a))) { brandAliases = aliases; break; }
   }
 
   let filtered = reparaciones;
-
   if (brandAliases) {
-    // Filtrar por marca
     filtered = reparaciones.filter(r =>
-      brandAliases.some(a =>
-        r['Marca'].toLowerCase().includes(a) ||
-        r['Modelo'].toLowerCase().includes(a)
-      )
+      brandAliases.some(a => r['Marca'].toLowerCase().includes(a) || r['Modelo'].toLowerCase().includes(a))
     );
-
-    // Refinar por modelo si se detectan palabras con número (ej: s24, iphone 13, a54)
-    const modelWords = msg.match(/\b(iphone\s*\d+[\w\s]*|s\d+\s*\w*|pixel\s*\d+\w*|galaxy\s*\w+|ipad\s*\w*|note\s*\d+|a\d+|ps\d|xbox\s*\w*|switch)\b/gi) || [];
+    const modelWords = allText.match(/\b(iphone\s*\d+[\w\s]*|s\d+\s*\w*|pixel\s*\d+\w*|galaxy\s*\w+|ipad\s*\w*|note\s*\d+|a\d+|ps\d|xbox\s*\w*|switch)\b/gi) || [];
     if (modelWords.length > 0) {
       const modelFiltered = filtered.filter(r =>
         modelWords.some(w => r['Modelo'].toLowerCase().includes(w.toLowerCase().trim()))
@@ -189,7 +294,6 @@ function filterRepairsByMessage(reparaciones, conversationText) {
     }
   }
 
-  // Si no se detectó nada relevante, devolver muestra general (un servicio por modelo)
   if (filtered.length === 0 || filtered === reparaciones) {
     const seen = new Set();
     filtered = reparaciones.filter(r => {
@@ -203,19 +307,16 @@ function filterRepairsByMessage(reparaciones, conversationText) {
   return filtered;
 }
 
-function buildPriceContext(data, userMessage = '') {
+function buildPriceContext(data, history = [], currentMsg = '') {
   let ctx = '';
   const repsActivas = data.reparaciones.filter(r => r['Notas / Estado'] !== 'Descontinuado');
 
   if (repsActivas.length > 0) {
-    // Usar búsqueda inteligente si hay mensaje del cliente
-    const relevant = userMessage
-      ? filterRepairsByMessage(repsActivas, userMessage)
+    const relevant = (history.length > 0 || currentMsg)
+      ? filterRepairsByConversation(repsActivas, history, currentMsg)
       : repsActivas.slice(0, 80);
-
     ctx += '\nREPARACIONES:\n';
     relevant.forEach(r => {
-      // El Sheet ya incluye el símbolo $ en las celdas — no agregar otro
       const min = r['Precio Mín ($)'].replace(/^\$/, '');
       const max = r['Precio Máx ($)'].replace(/^\$/, '');
       ctx += `- ${r['Dispositivo']} ${r['Marca']} ${r['Modelo']} - ${r['Servicio']}: $${min}-$${max} | ${r['Tiempo Estim.']}\n`;
@@ -248,12 +349,15 @@ function buildSystemPrompt(priceContext) {
   const now = new Date().toLocaleString('es-PR', {
     timeZone: 'America/Puerto_Rico',
     weekday: 'long', year: 'numeric', month: 'long',
-    day: 'numeric', hour: '2-digit', minute: '2-digit'
+    day: 'numeric', hour: '2-digit', minute: '2-digit',
   });
+  const abierto = isBusinessHours();
 
   return `Eres Alex, asistente virtual de 911reparame en Puerto Rico. Responde SIEMPRE en español, amigable y conciso (max 3-4 oraciones). Usa emojis ocasionalmente.
 
 FECHA Y HORA ACTUAL (Puerto Rico): ${now}
+ESTADO DEL NEGOCIO AHORA: ${abierto ? '🟢 ABIERTO' : '🔴 CERRADO'}
+${!abierto ? '⚠️ Si el cliente pregunta si están abiertos, indica que en este momento están cerrados y menciona el horario regular.' : ''}
 
 INFORMACIÓN DEL NEGOCIO:
 - Nombre: 911reparame
@@ -277,77 +381,47 @@ DIAGNÓSTICO:
 - Si el cliente acepta la reparación, esos $10 se descuentan del precio final
 
 INSTRUCCIONES DE COTIZACIÓN:
-- Cuando el cliente mencione un dispositivo o servicio, comparte enseguida el rango de precio ("entre $X y $Y") de forma natural y amigable
+- Cuando el cliente mencione un dispositivo o servicio, comparte enseguida el rango de precio de forma natural
 - Para afinar la cotización pide: marca, modelo exacto y descripción del problema
 - Nunca inventes precios que no estén en la lista
-- Si hay varios modelos similares, muestra los rangos disponibles para que el cliente elija
+- Si hay varios modelos similares, muestra los rangos disponibles
 - Si el servicio no está en la lista di que un asesor confirmará el precio
 
 CAPTURA DE LEADS:
 - Cuando el cliente quiera proceder, pide su nombre y teléfono
-- Al recibir nombre y teléfono, incluye al FINAL de tu respuesta (invisible para el cliente) la siguiente etiqueta exacta:
+- Al recibir nombre y teléfono, incluye al FINAL de tu respuesta:
   [LEAD: nombre=NOMBRE_AQUI, telefono=TELEFONO_AQUI, servicio=SERVICIO_AQUI]
-- Esta etiqueta es solo para el sistema, no la menciones ni expliques al cliente
+- Esta etiqueta es solo para el sistema
 
 UBICACIÓN Y DIRECCIONES:
-- Cuando el cliente pregunte cómo llegar, la dirección, la ubicación o dónde están, incluye al FINAL de tu respuesta la etiqueta exacta: [UBICACION]
-- El sistema enviará automáticamente un botón interactivo con el enlace a Google Maps
-- No incluyas URLs largas en tu texto, solo la etiqueta [UBICACION]
+- Cuando pregunten cómo llegar o dónde están, incluye al FINAL: [UBICACION]
+- No incluyas URLs largas en tu texto
 
 OTRAS INSTRUCCIONES:
 - Si no sabes algo di que un asesor confirmará pronto
-- Si preguntan por horario de sábado indica que es variable y que llamen al 787-996-6976 para confirmar
-- Usa la FECHA Y HORA ACTUAL para responder preguntas sobre si estamos abiertos ahora mismo
+- Si preguntan por horario de sábado indica que es variable y que llamen al 787-996-6976
 
 PRECIOS ACTUALIZADOS:
 ${priceContext}`;
 }
 
-// ─── Enviar mensaje de texto WhatsApp ────────────────────────────────────────
-async function sendWhatsAppMessage(phoneNumberId, to, text) {
-  await axios.post(
-    `https://graph.facebook.com/${WHATSAPP_API_VERSION}/${phoneNumberId}/messages`,
-    { messaging_product: 'whatsapp', to, type: 'text', text: { body: text } },
-    { headers: { Authorization: `Bearer ${WHATSAPP_TOKEN}`, 'Content-Type': 'application/json' } }
-  );
-}
-
-// ─── Enviar botón "Como llegar" con enlace a Google Maps ──────────────────────
-async function sendLocationButton(phoneNumberId, to) {
-  await axios.post(
-    `https://graph.facebook.com/${WHATSAPP_API_VERSION}/${phoneNumberId}/messages`,
-    {
-      messaging_product: 'whatsapp',
-      to,
-      type: 'interactive',
-      interactive: {
-        type: 'cta_url',
-        body: {
-          text: '📍 *Carretera 149, intersección con Carretera 2*\nFrente a Manatí Plaza Shopping Center\n\nToca el botón para abrir Google Maps:',
-        },
-        action: {
-          name: 'cta_url',
-          parameters: {
-            display_text: 'Como llegar 📍',
-            url: MAPS_URL,
-          },
-        },
-      },
-    },
-    { headers: { Authorization: `Bearer ${WHATSAPP_TOKEN}`, 'Content-Type': 'application/json' } }
-  );
+// ─── Manejar selección de menú ────────────────────────────────────────────────
+function menuToText(menuId) {
+  const map = {
+    menu_cotizar: '¿Cuánto cuesta reparar mi celular?',
+    menu_horario: '¿Cuál es su horario y dónde están ubicados?',
+    menu_ventas:  '¿Qué equipos tienen en venta?',
+    menu_asesor:  'Quisiera hablar con un asesor.',
+  };
+  return map[menuId] || null;
 }
 
 // ─── Webhook verificación ─────────────────────────────────────────────────────
 app.get('/webhook', (req, res) => {
   const verify_token = req.query['hub.verify_token'];
   const challenge    = req.query['hub.challenge'];
-  if (verify_token === VERIFY_TOKEN) {
-    console.log('Webhook verificado');
-    res.send(challenge);
-  } else {
-    res.sendStatus(403);
-  }
+  if (verify_token === VERIFY_TOKEN) { console.log('Webhook verificado'); res.send(challenge); }
+  else res.sendStatus(403);
 });
 
 // ─── Webhook mensajes ─────────────────────────────────────────────────────────
@@ -359,102 +433,144 @@ app.post('/webhook', async (req, res) => {
     const message        = changes?.value?.messages?.[0];
     if (!message) return;
 
+    const msgId           = message.id;
     const from            = message.from;
     const phone_number_id = changes?.value?.metadata?.phone_number_id;
 
-    // ── Rate limiting ──────────────────────────────────────────────────────
+    // ── Deduplicación ─────────────────────────────────────────────────────
+    if (processedMsgIds.has(msgId)) { console.log('Mensaje duplicado ignorado:', msgId); return; }
+    processedMsgIds.add(msgId);
+
+    // ── Mark as read ──────────────────────────────────────────────────────
+    await markAsRead(phone_number_id, msgId);
+
+    // ── Rate limiting ─────────────────────────────────────────────────────
     if (isRateLimited(from)) {
-      console.warn('Rate limit alcanzado para:', from);
-      await sendWhatsAppMessage(phone_number_id, from,
-        'Estás enviando mensajes muy rápido. Por favor espera un momento antes de continuar. 🙏');
+      await sendWhatsAppMessage(phone_number_id, from, 'Estás enviando mensajes muy rápido. Por favor espera un momento. 🙏');
       return;
     }
 
-    // ── Solo procesar texto; responder amablemente a otros tipos ──────────
-    if (message.type !== 'text') {
-      console.log(`Mensaje tipo "${message.type}" de ${from} — no soportado`);
+    // ── Extraer texto (mensaje normal o selección de menú) ────────────────
+    let msg_body = null;
+    if (message.type === 'text') {
+      msg_body = message.text.body.trim();
+    } else if (message.type === 'interactive' && message.interactive?.type === 'list_reply') {
+      const menuId = message.interactive.list_reply.id;
+      msg_body = menuToText(menuId);
+      if (!msg_body) return;
+    } else {
       await sendWhatsAppMessage(phone_number_id, from,
-        'Por el momento solo puedo procesar mensajes de texto 📝. Descríbeme tu consulta o el problema con tu equipo y con gusto te ayudo. 😊');
+        'Por el momento solo puedo procesar mensajes de texto 📝. Descríbeme tu consulta y con gusto te ayudo. 😊');
       return;
     }
 
-    const msg_body = message.text.body;
     console.log('Mensaje de', from, ':', msg_body);
+
+    // ── Comando reiniciar ─────────────────────────────────────────────────
+    if (/^(reiniciar|reset|restart|borrar|limpiar)$/i.test(msg_body)) {
+      await saveHistory(from, []);
+      await sendWhatsAppMessage(phone_number_id, from,
+        '✅ Conversación reiniciada. ¿En qué te puedo ayudar? 😊');
+      return;
+    }
+
+    // ── Bienvenida para usuario nuevo ─────────────────────────────────────
+    const newUser = await isNewUser(from);
+    if (newUser) {
+      await markUserSeen(from);
+      await sendWelcomeMenu(phone_number_id, from);
+      // Si solo saludó (hola, hi, etc.) terminar aquí para no duplicar respuesta
+      if (/^(hola|hi|hello|buenas|hey|buen|saludos|ola)[\s!]*$/i.test(msg_body)) return;
+    }
 
     // ── Historial ─────────────────────────────────────────────────────────
     let history = await getHistory(from);
     history.push({ role: 'user', content: msg_body });
     if (history.length > MAX_HISTORY_MESSAGES) history = history.slice(-MAX_HISTORY_MESSAGES);
 
-    // ── Llamada a Claude ──────────────────────────────────────────────────
+    // ── Precios con contexto de conversación completa ─────────────────────
     const priceData    = await getPriceData();
-    const priceContext = buildPriceContext(priceData, msg_body);
+    const priceContext = buildPriceContext(priceData, history, msg_body);
     const systemPrompt = buildSystemPrompt(priceContext);
 
-    const aiResponse = await client.messages.create({
-      model: 'claude-haiku-4-5-20251001',
-      max_tokens: 500,
-      system: systemPrompt,
-      messages: history,
-    });
-    let reply = aiResponse.content[0].text;
+    // ── Llamada a Claude con timeout ──────────────────────────────────────
+    let reply;
+    try {
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), CLAUDE_TIMEOUT_MS);
+      const aiResponse = await client.messages.create(
+        { model: 'claude-haiku-4-5-20251001', max_tokens: 500, system: systemPrompt, messages: history },
+        { signal: controller.signal }
+      );
+      clearTimeout(timer);
+      reply = aiResponse.content[0].text;
+    } catch (claudeErr) {
+      console.error('Error Claude:', claudeErr.message);
+      reply = 'En este momento tengo un problema técnico. Por favor llámanos al 787-996-6976 o escríbenos en un momento. 🙏';
+      history.push({ role: 'assistant', content: reply });
+      await saveHistory(from, history);
+      await sendWhatsAppMessage(phone_number_id, from, reply);
+      return;
+    }
 
-    // ── Detectar y guardar lead ───────────────────────────────────────────
+    // ── Detectar lead ─────────────────────────────────────────────────────
     const leadMatch = reply.match(/\[LEAD:\s*nombre=([^,\]]+),\s*telefono=([^,\]]+),\s*servicio=([^\]]+)\]/i);
     if (leadMatch) {
       const [, nombre, telefono, servicio] = leadMatch;
       reply = reply.replace(leadMatch[0], '').trim();
       await saveLead(nombre.trim(), telefono.trim(), servicio.trim(), from);
+      await notifyOwner(nombre.trim(), telefono.trim(), servicio.trim(), from);
     }
 
-    // ── Detectar si el bot quiere enviar botón de ubicación ───────────────
+    // ── Detectar botón ubicación ──────────────────────────────────────────
     const sendLocation = /\[UBICACION\]/i.test(reply);
     reply = reply.replace(/\[UBICACION\]/gi, '').trim();
 
-    // ── Guardar historial y enviar respuesta ──────────────────────────────
+    // ── Guardar historial y enviar ────────────────────────────────────────
     history.push({ role: 'assistant', content: reply });
     await saveHistory(from, history);
     await sendWhatsAppMessage(phone_number_id, from, reply);
     if (sendLocation) await sendLocationButton(phone_number_id, from);
     console.log('Respuesta enviada a', from, sendLocation ? '+ botón ubicación' : '');
+
   } catch (err) {
-    console.error('Error:', err.message, JSON.stringify(err?.response?.data));
+    console.error('Error webhook:', err.message, JSON.stringify(err?.response?.data));
   }
 });
 
 // ─── Health check ─────────────────────────────────────────────────────────────
 app.get('/', (req, res) => {
   res.json({
-    status: 'ok',
-    negocio: '911reparame Bot',
-    version: '3.0',
+    status: 'ok', negocio: '911reparame Bot', version: '4.0',
     whatsapp_api: WHATSAPP_API_VERSION,
     redis: redisClient ? 'conectado' : 'memoria',
+    abierto: isBusinessHours(),
   });
 });
 
-// ─── Debug precios ────────────────────────────────────────────────────────────
-// Uso: /debug-prices?q=samsung+s24+ultra
+// ─── Debug precios ─────────────────────────────────────────────────────────────
 app.get('/debug-prices', async (req, res) => {
-  const query   = req.query.q || '';
-  const data    = await getPriceData();
-  const context = buildPriceContext(data, query);
+  const query = req.query.q || '';
+  const data  = await getPriceData();
+  const context = buildPriceContext(data, [], query);
   res.json({
-    totales: {
-      reparaciones: data.reparaciones.length,
-      ventas: data.ventas.length,
-      accesorios: data.accesorios.length,
-    },
-    query_usada: query || '(ninguna — muestra general)',
+    totales: { reparaciones: data.reparaciones.length, ventas: data.ventas.length, accesorios: data.accesorios.length },
+    query_usada: query || '(ninguna)',
     contexto_enviado_al_bot: context,
     muestra_reparaciones: data.reparaciones.slice(0, 5),
   });
 });
 
+// ─── Forzar recarga de caché de precios ───────────────────────────────────────
+app.get('/refresh-prices', async (req, res) => {
+  await getPriceData(true);
+  res.json({ status: 'ok', mensaje: 'Cache de precios actualizado', timestamp: new Date().toISOString() });
+});
+
 // ─── Inicio ───────────────────────────────────────────────────────────────────
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, async () => {
-  console.log(`911reparame Bot v3.0 corriendo en puerto ${PORT}`);
-  console.log(`WhatsApp API: ${WHATSAPP_API_VERSION}`);
+  console.log(`911reparame Bot v4.0 corriendo en puerto ${PORT}`);
+  console.log(`WhatsApp API: ${WHATSAPP_API_VERSION} | Redis: ${redisClient ? 'sí' : 'no'}`);
   await getPriceData();
 });
