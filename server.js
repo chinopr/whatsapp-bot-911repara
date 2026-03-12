@@ -37,6 +37,8 @@ const MAX_HISTORY_MESSAGES = 10;
 const RATE_LIMIT_WINDOW_MS = 60 * 1000; // 1 minuto
 const RATE_LIMIT_MAX_MSGS  = 10;        // máx mensajes por minuto por usuario
 
+const MAPS_URL = 'https://www.google.com/maps/dir//911+repara.me,+Walgreens,+Carretera+2+Int+Carretera+149+Frente+Farmacia,+Manat%C3%AD,+00674/@18.436519,-66.4390542,15z/data=!4m8!4m7!1m0!1m5!1m1!1s0x8c031780deae45f3:0x13d55e015794b54e!2m2!1d-66.475142!2d18.431694?entry=ttu&g_ep=EgoyMDI2MDMwOS4wIKXMDSoASAFQAw%3D%3D';
+
 const client = new Anthropic({ apiKey: CLAUDE_API_KEY });
 
 // ─── Historial de conversación (Redis o memoria) ─────────────────────────────
@@ -211,6 +213,11 @@ CAPTURA DE LEADS:
   [LEAD: nombre=NOMBRE_AQUI, telefono=TELEFONO_AQUI, servicio=SERVICIO_AQUI]
 - Esta etiqueta es solo para el sistema, no la menciones ni expliques al cliente
 
+UBICACIÓN Y DIRECCIONES:
+- Cuando el cliente pregunte cómo llegar, la dirección, la ubicación o dónde están, incluye al FINAL de tu respuesta la etiqueta exacta: [UBICACION]
+- El sistema enviará automáticamente un botón interactivo con el enlace a Google Maps
+- No incluyas URLs largas en tu texto, solo la etiqueta [UBICACION]
+
 OTRAS INSTRUCCIONES:
 - Si no sabes algo di que un asesor confirmará pronto
 - Si preguntan por horario de sábado indica que es variable y que llamen al 787-996-6976 para confirmar
@@ -220,11 +227,37 @@ PRECIOS ACTUALIZADOS:
 ${priceContext}`;
 }
 
-// ─── Enviar mensaje WhatsApp ──────────────────────────────────────────────────
+// ─── Enviar mensaje de texto WhatsApp ────────────────────────────────────────
 async function sendWhatsAppMessage(phoneNumberId, to, text) {
   await axios.post(
     `https://graph.facebook.com/${WHATSAPP_API_VERSION}/${phoneNumberId}/messages`,
     { messaging_product: 'whatsapp', to, type: 'text', text: { body: text } },
+    { headers: { Authorization: `Bearer ${WHATSAPP_TOKEN}`, 'Content-Type': 'application/json' } }
+  );
+}
+
+// ─── Enviar botón "Como llegar" con enlace a Google Maps ──────────────────────
+async function sendLocationButton(phoneNumberId, to) {
+  await axios.post(
+    `https://graph.facebook.com/${WHATSAPP_API_VERSION}/${phoneNumberId}/messages`,
+    {
+      messaging_product: 'whatsapp',
+      to,
+      type: 'interactive',
+      interactive: {
+        type: 'cta_url',
+        body: {
+          text: '📍 *Carretera 149, intersección con Carretera 2*\nFrente a Manatí Plaza Shopping Center\n\nToca el botón para abrir Google Maps:',
+        },
+        action: {
+          name: 'cta_url',
+          parameters: {
+            display_text: 'Como llegar 📍',
+            url: MAPS_URL,
+          },
+        },
+      },
+    },
     { headers: { Authorization: `Bearer ${WHATSAPP_TOKEN}`, 'Content-Type': 'application/json' } }
   );
 }
@@ -298,11 +331,16 @@ app.post('/webhook', async (req, res) => {
       await saveLead(nombre.trim(), telefono.trim(), servicio.trim(), from);
     }
 
+    // ── Detectar si el bot quiere enviar botón de ubicación ───────────────
+    const sendLocation = /\[UBICACION\]/i.test(reply);
+    reply = reply.replace(/\[UBICACION\]/gi, '').trim();
+
     // ── Guardar historial y enviar respuesta ──────────────────────────────
     history.push({ role: 'assistant', content: reply });
     await saveHistory(from, history);
     await sendWhatsAppMessage(phone_number_id, from, reply);
-    console.log('Respuesta enviada a', from);
+    if (sendLocation) await sendLocationButton(phone_number_id, from);
+    console.log('Respuesta enviada a', from, sendLocation ? '+ botón ubicación' : '');
   } catch (err) {
     console.error('Error:', err.message, JSON.stringify(err?.response?.data));
   }
