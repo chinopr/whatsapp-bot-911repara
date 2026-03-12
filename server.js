@@ -43,6 +43,15 @@ const SHEETS_TIMEOUT_MS     = 10000; // 10 seg
 
 const MAPS_URL = 'https://www.google.com/maps/dir//911+repara.me,+Walgreens,+Carretera+2+Int+Carretera+149+Frente+Farmacia,+Manat%C3%AD,+00674/@18.436519,-66.4390542,15z/data=!4m8!4m7!1m0!1m5!1m1!1s0x8c031780deae45f3:0x13d55e015794b54e!2m2!1d-66.475142!2d18.431694?entry=ttu&g_ep=EgoyMDI2MDMwOS4wIKXMDSoASAFQAw%3D%3D';
 
+// ─── Stats (en memoria, se reinician con el servidor) ─────────────────────────
+const stats = {
+  messagesReceived: 0,
+  leadsCapturados: 0,
+  escalaciones: 0,
+  erroresClaude: 0,
+  startTime: new Date().toISOString(),
+};
+
 const client = new Anthropic({ apiKey: CLAUDE_API_KEY });
 
 // ─── Deduplicación de mensajes ────────────────────────────────────────────────
@@ -180,11 +189,17 @@ async function sendWelcomeMenu(phoneNumberId, to) {
 }
 
 // ─── Notificar al dueño cuando llega un lead ──────────────────────────────────
-async function notifyOwner(nombre, telefono, servicio, clienteWa) {
+async function notifyOwner(nombre, telefono, servicio, clienteWa, history = []) {
   if (!OWNER_PHONE || !PHONE_NUMBER_ID) return;
   try {
-    const msg = `🔔 *Nuevo Lead — 911reparame*\n\n👤 *Nombre:* ${nombre}\n📞 *Teléfono:* ${telefono}\n🔧 *Servicio:* ${servicio}\n📱 *WhatsApp cliente:* +${clienteWa}`;
+    // Resumen de conversación (últimos 4 intercambios)
+    const snippet = history.slice(-4)
+      .map(m => `${m.role === 'user' ? '👤' : '🤖'} ${m.content.substring(0, 80)}${m.content.length > 80 ? '…' : ''}`)
+      .join('\n');
+
+    const msg = `🔔 *Nuevo Lead — 911reparame*\n\n👤 *Nombre:* ${nombre}\n📞 *Teléfono:* ${telefono}\n🔧 *Servicio:* ${servicio}\n📱 *WhatsApp:* wa.me/${clienteWa}${snippet ? `\n\n💬 *Contexto:*\n${snippet}` : ''}`;
     await sendWhatsAppMessage(PHONE_NUMBER_ID, OWNER_PHONE, msg);
+    stats.escalaciones++;
     console.log('Dueño notificado del lead:', nombre);
   } catch (err) {
     console.error('Error notificando al dueño:', err.message);
@@ -345,15 +360,18 @@ function buildPriceContext(data, history = [], currentMsg = '') {
 }
 
 // ─── System prompt ────────────────────────────────────────────────────────────
-function buildSystemPrompt(priceContext) {
+function buildSystemPrompt(priceContext, lang = 'es') {
   const now = new Date().toLocaleString('es-PR', {
     timeZone: 'America/Puerto_Rico',
     weekday: 'long', year: 'numeric', month: 'long',
     day: 'numeric', hour: '2-digit', minute: '2-digit',
   });
   const abierto = isBusinessHours();
+  const langInstruction = lang === 'en'
+    ? 'The customer is writing in ENGLISH — respond entirely in English.'
+    : 'Responde SIEMPRE en español.';
 
-  return `Eres Alex, asistente virtual de 911reparame en Puerto Rico. Responde SIEMPRE en español, amigable y conciso (max 3-4 oraciones). Usa emojis ocasionalmente.
+  return `Eres Alex, asistente virtual de 911reparame en Puerto Rico. ${langInstruction} Sé amigable y conciso (max 3-4 oraciones). Usa emojis ocasionalmente.
 
 FECHA Y HORA ACTUAL (Puerto Rico): ${now}
 ESTADO DEL NEGOCIO AHORA: ${abierto ? '🟢 ABIERTO' : '🔴 CERRADO'}
@@ -405,15 +423,32 @@ PRECIOS ACTUALIZADOS:
 ${priceContext}`;
 }
 
+// ─── Detección de idioma ──────────────────────────────────────────────────────
+function detectLanguage(text) {
+  const enWords = /\b(hi|hello|hey|how|much|repair|cost|price|where|when|open|closed|phone|screen|battery|fix|buy|sell|help|please|thanks|thank|you|is|are|do|can|what|your|hours|location)\b/i;
+  const esWords = /\b(hola|precio|cuánto|reparar|pantalla|batería|celular|dónde|cuándo|abierto|cerrado|ayuda|gracias|cómo|tiene|están|cuál|horario|ubicación|quisiera|necesito)\b/i;
+  const enScore = (text.match(enWords) || []).length;
+  const esScore = (text.match(esWords) || []).length;
+  return enScore > esScore ? 'en' : 'es';
+}
+
 // ─── Manejar selección de menú ────────────────────────────────────────────────
-function menuToText(menuId) {
+function menuToText(menuId, lang = 'es') {
   const map = {
-    menu_cotizar: '¿Cuánto cuesta reparar mi celular?',
-    menu_horario: '¿Cuál es su horario y dónde están ubicados?',
-    menu_ventas:  '¿Qué equipos tienen en venta?',
-    menu_asesor:  'Quisiera hablar con un asesor.',
+    es: {
+      menu_cotizar: '¿Cuánto cuesta reparar mi celular?',
+      menu_horario: '¿Cuál es su horario y dónde están ubicados?',
+      menu_ventas:  '¿Qué equipos tienen en venta?',
+      menu_asesor:  'Quisiera hablar con un asesor.',
+    },
+    en: {
+      menu_cotizar: 'How much does it cost to repair my phone?',
+      menu_horario: 'What are your hours and where are you located?',
+      menu_ventas:  'What devices do you have for sale?',
+      menu_asesor:  'I would like to speak with an advisor.',
+    },
   };
-  return map[menuId] || null;
+  return (map[lang] || map.es)[menuId] || null;
 }
 
 // ─── Webhook verificación ─────────────────────────────────────────────────────
@@ -450,20 +485,34 @@ app.post('/webhook', async (req, res) => {
       return;
     }
 
-    // ── Extraer texto (mensaje normal o selección de menú) ────────────────
+    // ── Extraer texto (mensaje normal, selección de menú o imagen) ─────────
     let msg_body = null;
+    let isImageMsg = false;
+
     if (message.type === 'text') {
-      msg_body = message.text.body.trim();
+      msg_body = message.text.body.trim().substring(0, 800); // límite 800 chars
     } else if (message.type === 'interactive' && message.interactive?.type === 'list_reply') {
       const menuId = message.interactive.list_reply.id;
-      msg_body = menuToText(menuId);
+      const history0 = await getHistory(from);
+      const lang0 = history0.length > 0
+        ? detectLanguage(history0.filter(m => m.role === 'user').map(m => m.content).join(' '))
+        : 'es';
+      msg_body = menuToText(menuId, lang0);
       if (!msg_body) return;
+    } else if (['image', 'document', 'video'].includes(message.type)) {
+      isImageMsg = true;
+      msg_body = `[El cliente envió una ${message.type === 'image' ? 'foto de su dispositivo' : 'archivo'}]`;
+    } else if (message.type === 'audio') {
+      await sendWhatsAppMessage(phone_number_id, from,
+        'Por el momento no puedo procesar notas de voz 🎙️. Escríbeme tu consulta y con gusto te ayudo. 😊');
+      return;
     } else {
       await sendWhatsAppMessage(phone_number_id, from,
-        'Por el momento solo puedo procesar mensajes de texto 📝. Descríbeme tu consulta y con gusto te ayudo. 😊');
+        'Por el momento solo proceso mensajes de texto 📝. Descríbeme tu consulta. 😊');
       return;
     }
 
+    stats.messagesReceived++;
     console.log('Mensaje de', from, ':', msg_body);
 
     // ── Comando reiniciar ─────────────────────────────────────────────────
@@ -488,10 +537,25 @@ app.post('/webhook', async (req, res) => {
     history.push({ role: 'user', content: msg_body });
     if (history.length > MAX_HISTORY_MESSAGES) history = history.slice(-MAX_HISTORY_MESSAGES);
 
+    // ── Detectar idioma desde toda la conversación del usuario ────────────
+    const allUserText = history.filter(m => m.role === 'user').map(m => m.content).join(' ');
+    const lang = detectLanguage(allUserText);
+
+    // ── Si es imagen, responder guiando al cliente ────────────────────────
+    if (isImageMsg) {
+      const imgReply = lang === 'en'
+        ? '📸 Thanks for sending the photo! To give you an accurate quote, please tell me:\n1. Device brand and model\n2. What type of repair you need\n\nOr call us at *787-996-6976* and we can review it in person. 😊'
+        : '📸 ¡Gracias por enviar la foto! Para darte un presupuesto preciso, cuéntame:\n1. Marca y modelo del equipo\n2. Qué tipo de reparación necesitas\n\nTambién puedes llamarnos al *787-996-6976* para revisarlo en persona. 😊';
+      history.push({ role: 'assistant', content: imgReply });
+      await saveHistory(from, history);
+      await sendWhatsAppMessage(phone_number_id, from, imgReply);
+      return;
+    }
+
     // ── Precios con contexto de conversación completa ─────────────────────
     const priceData    = await getPriceData();
     const priceContext = buildPriceContext(priceData, history, msg_body);
-    const systemPrompt = buildSystemPrompt(priceContext);
+    const systemPrompt = buildSystemPrompt(priceContext, lang);
 
     // ── Llamada a Claude con timeout ──────────────────────────────────────
     let reply;
@@ -506,7 +570,10 @@ app.post('/webhook', async (req, res) => {
       reply = aiResponse.content[0].text;
     } catch (claudeErr) {
       console.error('Error Claude:', claudeErr.message);
-      reply = 'En este momento tengo un problema técnico. Por favor llámanos al 787-996-6976 o escríbenos en un momento. 🙏';
+      stats.erroresClaude++;
+      reply = lang === 'en'
+        ? 'I\'m having a technical issue right now. Please call us at 787-996-6976 or try again in a moment. 🙏'
+        : 'En este momento tengo un problema técnico. Por favor llámanos al 787-996-6976 o escríbenos en un momento. 🙏';
       history.push({ role: 'assistant', content: reply });
       await saveHistory(from, history);
       await sendWhatsAppMessage(phone_number_id, from, reply);
@@ -519,7 +586,8 @@ app.post('/webhook', async (req, res) => {
       const [, nombre, telefono, servicio] = leadMatch;
       reply = reply.replace(leadMatch[0], '').trim();
       await saveLead(nombre.trim(), telefono.trim(), servicio.trim(), from);
-      await notifyOwner(nombre.trim(), telefono.trim(), servicio.trim(), from);
+      await notifyOwner(nombre.trim(), telefono.trim(), servicio.trim(), from, history);
+      stats.leadsCapturados++;
     }
 
     // ── Detectar botón ubicación ──────────────────────────────────────────
@@ -541,7 +609,7 @@ app.post('/webhook', async (req, res) => {
 // ─── Health check ─────────────────────────────────────────────────────────────
 app.get('/', (req, res) => {
   res.json({
-    status: 'ok', negocio: '911reparame Bot', version: '4.0',
+    status: 'ok', negocio: '911reparame Bot', version: '4.5',
     whatsapp_api: WHATSAPP_API_VERSION,
     redis: redisClient ? 'conectado' : 'memoria',
     abierto: isBusinessHours(),
@@ -567,10 +635,29 @@ app.get('/refresh-prices', async (req, res) => {
   res.json({ status: 'ok', mensaje: 'Cache de precios actualizado', timestamp: new Date().toISOString() });
 });
 
+// ─── Stats / métricas del bot ─────────────────────────────────────────────────
+app.get('/stats', (req, res) => {
+  const uptimeMs = Date.now() - new Date(stats.startTime).getTime();
+  const uptimeHours = (uptimeMs / 1000 / 60 / 60).toFixed(1);
+  res.json({
+    version: '4.5',
+    uptime: `${uptimeHours}h`,
+    startTime: stats.startTime,
+    mensajesRecibidos: stats.messagesReceived,
+    leadsCapturados: stats.leadsCapturados,
+    escalaciones: stats.escalaciones,
+    erroresClaude: stats.erroresClaude,
+    conversacionesEnMemoria: Object.keys(memoryHistory).length,
+    redis: redisClient ? 'conectado' : 'memoria',
+    whatsappApiVersion: WHATSAPP_API_VERSION,
+    abierto: isBusinessHours(),
+  });
+});
+
 // ─── Inicio ───────────────────────────────────────────────────────────────────
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, async () => {
-  console.log(`911reparame Bot v4.0 corriendo en puerto ${PORT}`);
+  console.log(`911reparame Bot v4.5 corriendo en puerto ${PORT}`);
   console.log(`WhatsApp API: ${WHATSAPP_API_VERSION} | Redis: ${redisClient ? 'sí' : 'no'}`);
   await getPriceData();
 });
