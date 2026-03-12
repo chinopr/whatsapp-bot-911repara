@@ -140,30 +140,106 @@ async function getPriceData() {
   }
 }
 
-function buildPriceContext(data) {
+// ─── Búsqueda inteligente de reparaciones ────────────────────────────────────
+// Alias de marcas y modelos comunes para detectar del mensaje del cliente
+const BRAND_ALIASES = {
+  apple:      ['apple', 'iphone', 'ipad', 'macbook', 'mac'],
+  samsung:    ['samsung', 'galaxy', 's24', 's23', 's22', 's21', 's20', 's10', 'note', 'a54', 'a34', 'a15'],
+  google:     ['google', 'pixel'],
+  motorola:   ['motorola', 'moto'],
+  lg:         ['lg'],
+  sony:       ['sony', 'xperia'],
+  huawei:     ['huawei'],
+  oneplus:    ['oneplus', 'one plus'],
+  nintendo:   ['nintendo', 'switch'],
+  playstation:['playstation', 'ps4', 'ps5', 'ps3'],
+  xbox:       ['xbox'],
+};
+
+function filterRepairsByMessage(reparaciones, conversationText) {
+  const msg = conversationText.toLowerCase();
+
+  // Detectar marca
+  let brandAliases = null;
+  for (const [, aliases] of Object.entries(BRAND_ALIASES)) {
+    if (aliases.some(a => msg.includes(a))) {
+      brandAliases = aliases;
+      break;
+    }
+  }
+
+  let filtered = reparaciones;
+
+  if (brandAliases) {
+    // Filtrar por marca
+    filtered = reparaciones.filter(r =>
+      brandAliases.some(a =>
+        r['Marca'].toLowerCase().includes(a) ||
+        r['Modelo'].toLowerCase().includes(a)
+      )
+    );
+
+    // Refinar por modelo si se detectan palabras con número (ej: s24, iphone 13, a54)
+    const modelWords = msg.match(/\b(iphone\s*\d+[\w\s]*|s\d+\s*\w*|pixel\s*\d+\w*|galaxy\s*\w+|ipad\s*\w*|note\s*\d+|a\d+|ps\d|xbox\s*\w*|switch)\b/gi) || [];
+    if (modelWords.length > 0) {
+      const modelFiltered = filtered.filter(r =>
+        modelWords.some(w => r['Modelo'].toLowerCase().includes(w.toLowerCase().trim()))
+      );
+      if (modelFiltered.length > 0) filtered = modelFiltered;
+    }
+  }
+
+  // Si no se detectó nada relevante, devolver muestra general (un servicio por modelo)
+  if (filtered.length === 0 || filtered === reparaciones) {
+    const seen = new Set();
+    filtered = reparaciones.filter(r => {
+      const key = `${r['Marca']} ${r['Modelo']}`;
+      if (seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    }).slice(0, 60);
+  }
+
+  return filtered;
+}
+
+function buildPriceContext(data, userMessage = '') {
   let ctx = '';
   const repsActivas = data.reparaciones.filter(r => r['Notas / Estado'] !== 'Descontinuado');
+
   if (repsActivas.length > 0) {
+    // Usar búsqueda inteligente si hay mensaje del cliente
+    const relevant = userMessage
+      ? filterRepairsByMessage(repsActivas, userMessage)
+      : repsActivas.slice(0, 80);
+
     ctx += '\nREPARACIONES:\n';
-    const byService = {};
-    repsActivas.forEach(r => {
-      const key = `${r['Dispositivo']} ${r['Marca']} ${r['Modelo']} - ${r['Servicio']}`;
-      byService[key] = { min: r['Precio Mín ($)'], max: r['Precio Máx ($)'], tiempo: r['Tiempo Estim.'] };
-    });
-    Object.entries(byService).slice(0, 120).forEach(([k, v]) => {
-      ctx += `- ${k}: $${v.min}-$${v.max} | ${v.tiempo}\n`;
+    relevant.forEach(r => {
+      // El Sheet ya incluye el símbolo $ en las celdas — no agregar otro
+      const min = r['Precio Mín ($)'].replace(/^\$/, '');
+      const max = r['Precio Máx ($)'].replace(/^\$/, '');
+      ctx += `- ${r['Dispositivo']} ${r['Marca']} ${r['Modelo']} - ${r['Servicio']}: $${min}-$${max} | ${r['Tiempo Estim.']}\n`;
     });
   }
+
   const ventasDisp = data.ventas.filter(v => v['Disponibilidad'] === 'Sí');
   if (ventasDisp.length > 0) {
     ctx += '\nEQUIPOS EN VENTA:\n';
-    ventasDisp.forEach(v => { ctx += `- ${v['Tipo']} ${v['Marca']} ${v['Modelo']} - ${v['Condición']} - $${v['Precio ($)']}\n`; });
+    ventasDisp.forEach(v => {
+      const precio = v['Precio ($)'].replace(/^\$/, '');
+      ctx += `- ${v['Tipo']} ${v['Marca']} ${v['Modelo']} - ${v['Condición']} - $${precio}\n`;
+    });
   }
+
   const accDisp = data.accesorios.filter(a => a['Disponibilidad'] === 'Sí');
   if (accDisp.length > 0) {
     ctx += '\nACCESORIOS:\n';
-    accDisp.forEach(a => { ctx += `- ${a['Tipo']}: ${a['Descripción']} - $${a['Precio ($)']}\n`; });
+    accDisp.forEach(a => {
+      const precio = a['Precio ($)'].replace(/^\$/, '');
+      ctx += `- ${a['Tipo']}: ${a['Descripción']} - $${precio}\n`;
+    });
   }
+
   return ctx;
 }
 
@@ -312,7 +388,7 @@ app.post('/webhook', async (req, res) => {
 
     // ── Llamada a Claude ──────────────────────────────────────────────────
     const priceData    = await getPriceData();
-    const priceContext = buildPriceContext(priceData);
+    const priceContext = buildPriceContext(priceData, msg_body);
     const systemPrompt = buildSystemPrompt(priceContext);
 
     const aiResponse = await client.messages.create({
@@ -358,15 +434,18 @@ app.get('/', (req, res) => {
 });
 
 // ─── Debug precios ────────────────────────────────────────────────────────────
+// Uso: /debug-prices?q=samsung+s24+ultra
 app.get('/debug-prices', async (req, res) => {
+  const query   = req.query.q || '';
   const data    = await getPriceData();
-  const context = buildPriceContext(data);
+  const context = buildPriceContext(data, query);
   res.json({
     totales: {
       reparaciones: data.reparaciones.length,
       ventas: data.ventas.length,
       accesorios: data.accesorios.length,
     },
+    query_usada: query || '(ninguna — muestra general)',
     contexto_enviado_al_bot: context,
     muestra_reparaciones: data.reparaciones.slice(0, 5),
   });
