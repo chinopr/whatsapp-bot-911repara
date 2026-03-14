@@ -1,8 +1,17 @@
 const express = require('express');
+const crypto = require('crypto');
 const axios = require('axios');
 const Anthropic = require('@anthropic-ai/sdk');
 const { google } = require('googleapis');
 require('dotenv').config();
+
+// ─── Validación fail-fast de variables de entorno ─────────────────────────────
+const REQUIRED_ENV = ['WHATSAPP_TOKEN', 'PHONE_NUMBER_ID', 'VERIFY_TOKEN', 'CLAUDE_API_KEY', 'GOOGLE_API_KEY', 'SHEET_ID'];
+const missing = REQUIRED_ENV.filter(k => !process.env[k]);
+if (missing.length > 0) {
+  console.error(`ERROR FATAL: Variables de entorno faltantes: ${missing.join(', ')}`);
+  process.exit(1);
+}
 
 // ─── Redis opcional ───────────────────────────────────────────────────────────
 let redisClient = null;
@@ -32,14 +41,19 @@ const CLAUDE_API_KEY  = process.env.CLAUDE_API_KEY;
 const GOOGLE_API_KEY  = process.env.GOOGLE_API_KEY;
 const SHEET_ID        = process.env.SHEET_ID;
 const OWNER_PHONE     = process.env.OWNER_PHONE; // ej: 17879966976 (sin + ni espacios)
+const CLAUDE_MODEL    = process.env.CLAUDE_MODEL || 'claude-haiku-4-5-20251001';
+const ADMIN_TOKEN     = process.env.ADMIN_TOKEN || null;
+const WA_APP_SECRET   = process.env.WHATSAPP_APP_SECRET || null;
 
+const BOT_VERSION           = '4.6';
 const WHATSAPP_API_VERSION  = 'v21.0';
 const HISTORY_TTL_SECONDS   = 60 * 60 * 24; // 24 horas
 const MAX_HISTORY_MESSAGES  = 10;
 const RATE_LIMIT_WINDOW_MS  = 60 * 1000;
 const RATE_LIMIT_MAX_MSGS   = 10;
 const CLAUDE_TIMEOUT_MS     = 15000; // 15 seg
-const SHEETS_TIMEOUT_MS     = 10000; // 10 seg
+const SHEETS_TIMEOUT_MS     = 10000; // 10 seg (Google Sheets)
+const WA_TIMEOUT_MS         = 10000; // 10 seg (WhatsApp API)
 
 const MAPS_URL = 'https://www.google.com/maps/dir//911+repara.me,+Walgreens,+Carretera+2+Int+Carretera+149+Frente+Farmacia,+Manat%C3%AD,+00674/@18.436519,-66.4390542,15z/data=!4m8!4m7!1m0!1m5!1m1!1s0x8c031780deae45f3:0x13d55e015794b54e!2m2!1d-66.475142!2d18.431694?entry=ttu&g_ep=EgoyMDI2MDMwOS4wIKXMDSoASAFQAw%3D%3D';
 
@@ -54,9 +68,21 @@ const stats = {
 
 const client = new Anthropic({ apiKey: CLAUDE_API_KEY });
 
-// ─── Deduplicación de mensajes ────────────────────────────────────────────────
+// ─── Deduplicación de mensajes (Redis con fallback a memoria) ─────────────────
 const processedMsgIds = new Set();
 setInterval(() => processedMsgIds.clear(), 10 * 60 * 1000); // limpiar cada 10 min
+
+async function isDuplicate(msgId) {
+  if (redisClient) {
+    const exists = await redisClient.exists(`dedup:${msgId}`);
+    if (exists) return true;
+    await redisClient.setEx(`dedup:${msgId}`, 600, '1'); // 10 min TTL
+    return false;
+  }
+  if (processedMsgIds.has(msgId)) return true;
+  processedMsgIds.add(msgId);
+  return false;
+}
 
 // ─── Historial (Redis o memoria) ──────────────────────────────────────────────
 const memoryHistory = {};
@@ -94,10 +120,16 @@ async function markUserSeen(userId) {
   }
 }
 
-// ─── Rate limiting ────────────────────────────────────────────────────────────
+// ─── Rate limiting (Redis con fallback a memoria) ─────────────────────────────
 const rateLimitMap = {};
 
-function isRateLimited(userId) {
+async function isRateLimited(userId) {
+  if (redisClient) {
+    const key = `rl:${userId}`;
+    const count = await redisClient.incr(key);
+    if (count === 1) await redisClient.expire(key, Math.ceil(RATE_LIMIT_WINDOW_MS / 1000));
+    return count > RATE_LIMIT_MAX_MSGS;
+  }
   const now = Date.now();
   if (!rateLimitMap[userId]) {
     rateLimitMap[userId] = { count: 1, windowStart: now };
@@ -132,7 +164,7 @@ const WA_URL = (id) => `https://graph.facebook.com/${WHATSAPP_API_VERSION}/${id}
 async function sendWhatsAppMessage(phoneNumberId, to, text) {
   await axios.post(WA_URL(phoneNumberId),
     { messaging_product: 'whatsapp', to, type: 'text', text: { body: text } },
-    { headers: WA_HEADERS(), timeout: SHEETS_TIMEOUT_MS }
+    { headers: WA_HEADERS(), timeout: WA_TIMEOUT_MS }
   );
 }
 
@@ -154,7 +186,7 @@ async function sendLocationButton(phoneNumberId, to) {
       body: { text: '📍 *Carretera 149, intersección con Carretera 2*\nFrente a Manatí Plaza Shopping Center\n\nToca el botón para abrir Google Maps:' },
       action: { name: 'cta_url', parameters: { display_text: 'Como llegar 📍', url: MAPS_URL } },
     },
-  }, { headers: WA_HEADERS(), timeout: SHEETS_TIMEOUT_MS });
+  }, { headers: WA_HEADERS(), timeout: WA_TIMEOUT_MS });
 }
 
 async function sendWelcomeMenu(phoneNumberId, to) {
@@ -180,7 +212,7 @@ async function sendWelcomeMenu(phoneNumberId, to) {
           }],
         },
       },
-    }, { headers: WA_HEADERS(), timeout: SHEETS_TIMEOUT_MS });
+    }, { headers: WA_HEADERS(), timeout: WA_TIMEOUT_MS });
   } catch (err) {
     // Si falla el menú (ej. sandbox no lo soporta), enviar texto simple
     await sendWhatsAppMessage(phoneNumberId, to,
@@ -332,9 +364,10 @@ function buildPriceContext(data, history = [], currentMsg = '') {
       : repsActivas.slice(0, 80);
     ctx += '\nREPARACIONES:\n';
     relevant.forEach(r => {
-      const min = r['Precio Mín ($)'].replace(/^\$/, '');
-      const max = r['Precio Máx ($)'].replace(/^\$/, '');
-      ctx += `- ${r['Dispositivo']} ${r['Marca']} ${r['Modelo']} - ${r['Servicio']}: $${min}-$${max} | ${r['Tiempo Estim.']}\n`;
+      const min = (r['Precio Mín ($)'] || '').replace(/^\$/, '');
+      const max = (r['Precio Máx ($)'] || '').replace(/^\$/, '');
+      if (!min && !max) return;
+      ctx += `- ${r['Dispositivo'] || ''} ${r['Marca'] || ''} ${r['Modelo'] || ''} - ${r['Servicio'] || ''}: $${min}-$${max} | ${r['Tiempo Estim.'] || 'N/A'}\n`;
     });
   }
 
@@ -342,8 +375,9 @@ function buildPriceContext(data, history = [], currentMsg = '') {
   if (ventasDisp.length > 0) {
     ctx += '\nEQUIPOS EN VENTA:\n';
     ventasDisp.forEach(v => {
-      const precio = v['Precio ($)'].replace(/^\$/, '');
-      ctx += `- ${v['Tipo']} ${v['Marca']} ${v['Modelo']} - ${v['Condición']} - $${precio}\n`;
+      const precio = (v['Precio ($)'] || '').replace(/^\$/, '');
+      if (!precio) return;
+      ctx += `- ${v['Tipo'] || ''} ${v['Marca'] || ''} ${v['Modelo'] || ''} - ${v['Condición'] || ''} - $${precio}\n`;
     });
   }
 
@@ -351,8 +385,9 @@ function buildPriceContext(data, history = [], currentMsg = '') {
   if (accDisp.length > 0) {
     ctx += '\nACCESORIOS:\n';
     accDisp.forEach(a => {
-      const precio = a['Precio ($)'].replace(/^\$/, '');
-      ctx += `- ${a['Tipo']}: ${a['Descripción']} - $${precio}\n`;
+      const precio = (a['Precio ($)'] || '').replace(/^\$/, '');
+      if (!precio) return;
+      ctx += `- ${a['Tipo'] || ''}: ${a['Descripción'] || ''} - $${precio}\n`;
     });
   }
 
@@ -451,6 +486,27 @@ function menuToText(menuId, lang = 'es') {
   return (map[lang] || map.es)[menuId] || null;
 }
 
+// ─── Middleware: validación de firma WhatsApp ─────────────────────────────────
+function verifyWebhookSignature(req, res, next) {
+  if (!WA_APP_SECRET) return next(); // sin secreto configurado, skip
+  const signature = req.headers['x-hub-signature-256'];
+  if (!signature) { res.sendStatus(401); return; }
+  const expectedSig = 'sha256=' + crypto.createHmac('sha256', WA_APP_SECRET).update(JSON.stringify(req.body)).digest('hex');
+  if (!crypto.timingSafeEqual(Buffer.from(signature), Buffer.from(expectedSig))) {
+    res.sendStatus(401);
+    return;
+  }
+  next();
+}
+
+// ─── Middleware: proteger endpoints admin ─────────────────────────────────────
+function requireAdmin(req, res, next) {
+  if (!ADMIN_TOKEN) { res.status(403).json({ error: 'Endpoint deshabilitado. Configure ADMIN_TOKEN.' }); return; }
+  const token = req.query.token || req.headers['x-admin-token'];
+  if (token !== ADMIN_TOKEN) { res.sendStatus(403); return; }
+  next();
+}
+
 // ─── Webhook verificación ─────────────────────────────────────────────────────
 app.get('/webhook', (req, res) => {
   const verify_token = req.query['hub.verify_token'];
@@ -460,7 +516,7 @@ app.get('/webhook', (req, res) => {
 });
 
 // ─── Webhook mensajes ─────────────────────────────────────────────────────────
-app.post('/webhook', async (req, res) => {
+app.post('/webhook', verifyWebhookSignature, async (req, res) => {
   res.sendStatus(200);
   try {
     const entry          = req.body?.entry?.[0];
@@ -473,14 +529,13 @@ app.post('/webhook', async (req, res) => {
     const phone_number_id = changes?.value?.metadata?.phone_number_id;
 
     // ── Deduplicación ─────────────────────────────────────────────────────
-    if (processedMsgIds.has(msgId)) { console.log('Mensaje duplicado ignorado:', msgId); return; }
-    processedMsgIds.add(msgId);
+    if (await isDuplicate(msgId)) { console.log('Mensaje duplicado ignorado:', msgId); return; }
 
     // ── Mark as read ──────────────────────────────────────────────────────
     await markAsRead(phone_number_id, msgId);
 
     // ── Rate limiting ─────────────────────────────────────────────────────
-    if (isRateLimited(from)) {
+    if (await isRateLimited(from)) {
       await sendWhatsAppMessage(phone_number_id, from, 'Estás enviando mensajes muy rápido. Por favor espera un momento. 🙏');
       return;
     }
@@ -563,7 +618,7 @@ app.post('/webhook', async (req, res) => {
       const controller = new AbortController();
       const timer = setTimeout(() => controller.abort(), CLAUDE_TIMEOUT_MS);
       const aiResponse = await client.messages.create(
-        { model: 'claude-haiku-4-5-20251001', max_tokens: 500, system: systemPrompt, messages: history },
+        { model: CLAUDE_MODEL, max_tokens: 500, system: systemPrompt, messages: history },
         { signal: controller.signal }
       );
       clearTimeout(timer);
@@ -609,7 +664,7 @@ app.post('/webhook', async (req, res) => {
 // ─── Health check ─────────────────────────────────────────────────────────────
 app.get('/', (req, res) => {
   res.json({
-    status: 'ok', negocio: '911reparame Bot', version: '4.5',
+    status: 'ok', negocio: '911reparame Bot', version: BOT_VERSION,
     whatsapp_api: WHATSAPP_API_VERSION,
     redis: redisClient ? 'conectado' : 'memoria',
     abierto: isBusinessHours(),
@@ -617,7 +672,7 @@ app.get('/', (req, res) => {
 });
 
 // ─── Debug precios ─────────────────────────────────────────────────────────────
-app.get('/debug-prices', async (req, res) => {
+app.get('/debug-prices', requireAdmin, async (req, res) => {
   const query = req.query.q || '';
   const data  = await getPriceData();
   const context = buildPriceContext(data, [], query);
@@ -630,17 +685,17 @@ app.get('/debug-prices', async (req, res) => {
 });
 
 // ─── Forzar recarga de caché de precios ───────────────────────────────────────
-app.get('/refresh-prices', async (req, res) => {
+app.get('/refresh-prices', requireAdmin, async (req, res) => {
   await getPriceData(true);
   res.json({ status: 'ok', mensaje: 'Cache de precios actualizado', timestamp: new Date().toISOString() });
 });
 
 // ─── Stats / métricas del bot ─────────────────────────────────────────────────
-app.get('/stats', (req, res) => {
+app.get('/stats', requireAdmin, (req, res) => {
   const uptimeMs = Date.now() - new Date(stats.startTime).getTime();
   const uptimeHours = (uptimeMs / 1000 / 60 / 60).toFixed(1);
   res.json({
-    version: '4.5',
+    version: BOT_VERSION,
     uptime: `${uptimeHours}h`,
     startTime: stats.startTime,
     mensajesRecibidos: stats.messagesReceived,
@@ -657,7 +712,7 @@ app.get('/stats', (req, res) => {
 // ─── Inicio ───────────────────────────────────────────────────────────────────
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, async () => {
-  console.log(`911reparame Bot v4.5 corriendo en puerto ${PORT}`);
+  console.log(`911reparame Bot v${BOT_VERSION} corriendo en puerto ${PORT}`);
   console.log(`WhatsApp API: ${WHATSAPP_API_VERSION} | Redis: ${redisClient ? 'sí' : 'no'}`);
   await getPriceData();
 });

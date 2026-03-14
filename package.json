@@ -1,10 +1,13 @@
 {
   "name": "whatsapp-bot-911reparame",
-  "version": "3.0.0",
+  "version": "4.6.0",
   "description": "WhatsApp Bot con IA para 911reparame",
   "main": "server.js",
   "scripts": {
-    "start": "node server.js"
+    "start": "node server.js",
+    "dev": "node --watch server.js",
+    "test": "node --test test/",
+    "lint": "npx eslint server.js"
   },
   "dependencies": {
     "express": "^4.18.2",
