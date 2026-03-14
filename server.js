@@ -240,24 +240,30 @@ async function notifyOwner(nombre, telefono, servicio, clienteWa, history = []) 
 
 // ─── Google Sheets — lead ─────────────────────────────────────────────────────
 async function saveLead(nombre, telefono, servicio, whatsappNum) {
-  try {
-    const keyJson = JSON.parse(process.env.GOOGLE_SERVICE_ACCOUNT_KEY);
-    const auth = new google.auth.GoogleAuth({
-      credentials: keyJson,
-      scopes: ['https://www.googleapis.com/auth/spreadsheets'],
-    });
-    const sheets = google.sheets({ version: 'v4', auth });
-    const fecha = new Date().toLocaleString('es-PR', { timeZone: 'America/Puerto_Rico' });
-    await sheets.spreadsheets.values.append({
-      spreadsheetId: SHEET_ID,
-      range: 'Leads!A:F',
-      valueInputOption: 'USER_ENTERED',
-      resource: { values: [[fecha, nombre, telefono, servicio, whatsappNum, 'Nuevo']] },
-    });
-    console.log('Lead guardado:', nombre, telefono, servicio);
-  } catch (err) {
-    console.error('Error guardando lead:', err.message);
+  const fecha = new Date().toLocaleString('es-PR', { timeZone: 'America/Puerto_Rico' });
+  // Intentar guardar en Google Sheets si hay credenciales de servicio
+  if (process.env.GOOGLE_SERVICE_ACCOUNT_KEY) {
+    try {
+      const keyJson = JSON.parse(process.env.GOOGLE_SERVICE_ACCOUNT_KEY);
+      const auth = new google.auth.GoogleAuth({
+        credentials: keyJson,
+        scopes: ['https://www.googleapis.com/auth/spreadsheets'],
+      });
+      const sheets = google.sheets({ version: 'v4', auth });
+      await sheets.spreadsheets.values.append({
+        spreadsheetId: SHEET_ID,
+        range: 'Leads!A:F',
+        valueInputOption: 'USER_ENTERED',
+        resource: { values: [[fecha, nombre, telefono, servicio, whatsappNum, 'Nuevo']] },
+      });
+      console.log('Lead guardado en Sheets:', nombre, telefono, servicio);
+      return;
+    } catch (err) {
+      console.error('Error guardando lead en Sheets:', err.message);
+    }
   }
+  // Sin credenciales de servicio: log del lead (la notificación WhatsApp al dueño se hace aparte)
+  console.log('Lead capturado (sin Sheets):', fecha, nombre, telefono, servicio, whatsappNum);
 }
 
 // ─── Google Sheets — precios ──────────────────────────────────────────────────
